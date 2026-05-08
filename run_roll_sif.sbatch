@@ -17,8 +17,6 @@ SIF=/export/projects/ml/roll.sif
 export RAY_TMPDIR=~/r
 
 apptainer exec \
-  --cleanenv \
-  --containall \
   --nv \
   --bind ~/workspace:/workspace \
   --bind ~/r:/tmp \
@@ -27,6 +25,8 @@ apptainer exec \
   bash -c "
 
     echo '===== CONTAINER ENV ====='
+
+    pip install --force-reinstall triton
 
     # Force clean container paths
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
