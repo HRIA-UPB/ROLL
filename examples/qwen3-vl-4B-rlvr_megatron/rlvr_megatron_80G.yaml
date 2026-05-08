@@ -16,11 +16,13 @@ output_dir: ./output
 
 checkpoint_config:
   type: file_system
-  output_dir: /data/cpfs_0/yuzhao/models
+  output_dir: .output/models
 
-track_with: tensorboard
+track_with: wandb
 tracker_kwargs:
-  log_dir: /data/oss_bucket_0/yuzhao/llm/tensorboard
+  api_key: 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
+  project: qwen3-vl-8B-rlvr
+  name: test_exp
 
 save_steps: 20
 logging_steps: 1
@@ -43,7 +45,7 @@ adv_estimator: "grpo"
 use_kl_loss: true
 kl_loss_coef: 1.0e-2
 
-pretrain: Qwen/Qwen3-VL-4B-Thinking
+pretrain: Qwen/Qwen3-VL-4B-Instruct
 
 validation:
  data_args:

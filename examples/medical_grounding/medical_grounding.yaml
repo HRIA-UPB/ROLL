@@ -1,0 +1,231 @@
+defaults:
+  - ../config/envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+# Custom pipeline that adds wandb trajectory image logging on eval steps.
+pipeline_cls: roll.pipeline.agentic.medical_grounding_pipeline.MedicalGroundingPipeline
+
+exp_name: "medical_grounding"
+seed: 42
+logging_dir: ./output/logs
+output_dir: ./output
+
+checkpoint_config:
+  type: file_system
+  output_dir: /data/checkpoints/${exp_name}
+
+track_with: wandb
+tracker_kwargs:
+  project: medical-grounding-rl
+  name: ${exp_name}
+  api_key: REDACTED_ROTATE_AND_SET_VIA_ENV_OR_LOGIN
+
+offload_nccl: true
+
+num_gpus_per_node: 8
+
+max_steps: 1000
+save_steps: 100
+logging_steps: 1
+eval_steps: 50
+resume_from_checkpoint: false
+
+rollout_batch_size: 256   # prompts per rollout batch (= num_env_groups * group_size)
+val_batch_size: 64
+response_length: 4096
+sequence_length: 20480
+
+reward_clip: 10
+advantage_clip: 5.0
+ppo_epochs: 1
+adv_estimator: "grpo"
+whiten_advantages: false
+add_token_level_kl: false
+use_kl_loss: false
+init_kl_coef: 0.0
+entropy_loss_coef: 0
+
+pretrain: Qwen/Qwen3-VL-4B-Instruct
+
+actor_train:
+  system_envs:
+    NVTE_FLASH_ATTN: '1'
+    NVTE_FUSED_ATTN: '0'
+    NVTE_UNFUSED_ATTN: '0'
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+    freeze_module_prefix: "visual"   # keep vision encoder frozen initially
+  training_args:
+    learning_rate: 1.0e-6
+    lr_scheduler_type: constant
+    weight_decay: 1.0e-2
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 64
+    warmup_steps: 5
+  strategy_args:
+    strategy_name: megatron_train
+    strategy_config:
+      tensor_model_parallel_size: 1
+      sequence_parallel: true
+      context_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      use_distributed_optimizer: true
+      recompute_granularity: full
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+  offload_nccl: ${offload_nccl}
+  use_dynamic_batching_in_train: true
+  max_tokens_per_microbatch_in_train: 24576
+  sequence_length_round_in_train: 8
+  use_dynamic_batching_in_infer: true
+  max_tokens_per_microbatch_in_infer: 24576
+  sequence_length_round_in_infer: 8
+
+actor_infer:
+  system_envs:
+    NVTE_FLASH_ATTN: '1'
+    NVTE_FUSED_ATTN: '0'
+    NVTE_UNFUSED_ATTN: '0'
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: ${response_length}
+    top_p: 1.0
+    top_k: -1
+    num_beams: 1
+    temperature: 1.0
+    num_return_sequences: 1
+  strategy_args:
+    strategy_name: vllm
+    strategy_config:
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      block_size: 16
+      sleep_level: 2
+  device_mapping: list(range(4,8))
+  offload_nccl: ${offload_nccl}
+
+reference:
+  system_envs:
+    NVTE_FLASH_ATTN: '1'
+    NVTE_FUSED_ATTN: '0'
+    NVTE_UNFUSED_ATTN: '0'
+  model_args:
+    attn_implementation: fa2
+    disable_gradient_checkpointing: false
+    dtype: bf16
+    model_type: ~
+  strategy_args:
+    strategy_name: megatron_infer
+    strategy_config:
+      tensor_model_parallel_size: 1
+      sequence_parallel: true
+      pipeline_model_parallel_size: 1
+  device_mapping: list(range(0,4))
+  infer_batch_size: 1
+  offload_nccl: ${offload_nccl}
+  use_dynamic_batching_in_infer: true
+  max_tokens_per_microbatch_in_infer: 24576
+  sequence_length_round_in_infer: 8
+
+max_actions_per_traj: 5
+
+reward_normalization:
+  grouping: traj_group_id
+  method: mean_std
+
+# ---------------------------------------------------------------------------
+# Environment configuration
+# ---------------------------------------------------------------------------
+custom_envs:
+  medical_grounding:
+    env_type: medical_grounding
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${response_length}
+    env_manager_cls: roll.pipeline.agentic.env_manager.vl_traj_env_manager.VLTrajEnvManager
+    use_thread_lock: true
+
+    # System prompt injected as the LLM system message (system role).
+    agent_system_template: |
+      You are a specialized Medical Imaging AI Agent. Your goal is to precisely
+      localize anatomical structures, lesions, or findings described in referring
+      expressions.
+
+      How to respond:
+      ALWAYS start by reasoning inside <think></think> tags before taking any action.
+
+      Tools (call exactly one per turn inside <tool_call></tool_call>):
+        zoom[x1, y1, x2, y2]  – crop the current viewport to a subregion.
+        pan[x, y]              – shift the viewport so [x, y] becomes its center.
+        zoomout[factor]        – expand the field of view (factor > 1.0).
+        resetzoom              – return to the full original image.
+
+      Coordinate conventions (normalized [0, 1]):
+        x increases left→right, y increases top→bottom.
+        All coordinates are relative to the *current* viewport (tools) or the
+        *original* image (<answer>).
+
+      When you have confidently identified the target:
+        <answer>bbox[x1, y1, x2, y2]</answer>
+
+      Example turn:
+        <think>There is a suspicious nodular density in the upper-right region.
+        I should zoom in for a closer look.</think>
+        <tool_call>zoom[0.55, 0.10, 0.95, 0.55]</tool_call>
+
+    # Text injected before/after each observation turn.
+    pre_step_template: ""
+    next_step_template: ""
+
+    env_config:
+      # --- REQUIRED: update these paths before training ---
+      data_path: /export/home/acs/prof/andrei.mihalea/data/HRIA/vlm/refpath/train.jsonl   # JSON/JSONL with bbox+expression records
+      image_dir: /export/home/acs/prof/andrei.mihalea/data/HRIA/vlm/refpath/refpath_image           # directory containing image files
+      # ---
+
+      mode: train
+      seed: ${seed}
+      max_steps: ${max_actions_per_traj}
+      max_image_width: 512        # resize images to this max width (aspect ratio preserved)
+
+      # Reward shaping
+      step_penalty: -0.01         # applied every step
+      format_penalty: -0.5        # extra penalty when no valid action found
+      iou_threshold: 0.5          # IoU >= this counts as success
+      viewport_iou_weight: 0.3    # coefficient for intermediate viewport IoU reward
+      answer_iou_weight: 1.0      # coefficient for final answer IoU reward
+
+      # Trajectory logging
+      # All env workers must be able to write here; the pipeline process must
+      # be able to read here (shared filesystem required for multi-node).
+      trajectory_log_dir: ./output/trajectories
+      max_logged_trajectories: 1   # per env instance
+
+train_env_manager:
+  max_env_num_per_worker: 16
+  num_env_groups: 32             # = rollout_batch_size / group_size
+  group_size: 8                  # trajectories collected with the same seed
+  tags: [medical_grounding]
+  num_groups_partition:
+    - 32
+
+val_env_manager:
+  max_env_num_per_worker: 16
+  num_env_groups: ${val_batch_size}
+  group_size: 1                  # deterministic eval: one trajectory per seed
+  tags: [medical_grounding]
+  num_groups_partition:
+    - ${val_batch_size}
