@@ -15,7 +15,7 @@ Action format:
         <tool_call>pan[x, y]</tool_call>
         <tool_call>zoomout[factor]</tool_call>
         <tool_call>resetzoom</tool_call>
-    Final answer (normalized [0, 1] to *original* image):
+    Final answer (normalized [0, 1] relative to *current* viewport):
         <answer>bbox[x1, y1, x2, y2]</answer>
 
 Reward structure:
@@ -31,9 +31,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import PIL.Image as Image
 from gem import Env
 
+from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.env.medical_grounding.dataset import MedicalGroundingDataset
 from roll.pipeline.agentic.env.medical_grounding.rewards import prediction_iou, viewport_iou
 from roll.pipeline.agentic.env.medical_grounding.toolbox import Viewport, ViewportToolBox
@@ -81,6 +83,8 @@ class MedicalGroundingEnv(Env):
             instance (prevents disk bloat during long runs).
         max_image_width: If set, resize images to this max width while preserving
             aspect ratio. If None, images are loaded at original resolution.
+        max_aspect_ratio: Maximum allowed aspect ratio for viewport and answer
+            bounding boxes. Values above this limit are treated as format errors.
     """
 
     image_placeholder: str = _IMAGE_PLACEHOLDER
@@ -100,6 +104,7 @@ class MedicalGroundingEnv(Env):
         trajectory_log_dir: Optional[str] = None,
         max_logged_trajectories: int = 20,
         max_image_width: Optional[int] = None,
+        max_aspect_ratio: float = 200.0,
         **kwargs: Any,
     ) -> None:
         self.max_steps = max_steps
@@ -108,6 +113,7 @@ class MedicalGroundingEnv(Env):
         self.iou_threshold = iou_threshold
         self.viewport_iou_weight = viewport_iou_weight
         self.answer_iou_weight = answer_iou_weight
+        self.max_aspect_ratio = max_aspect_ratio
         self.trajectory_log_dir = trajectory_log_dir
         self.max_logged_trajectories = max_logged_trajectories
 
@@ -129,6 +135,7 @@ class MedicalGroundingEnv(Env):
         # Logging state
         self._logged_count = 0
         self._log_lock = threading.Lock()
+        self._messages: List[Dict] = []
 
     # ------------------------------------------------------------------
     # Gym interface
@@ -144,7 +151,7 @@ class MedicalGroundingEnv(Env):
         """
         data = self.dataset.get_item(seed if seed is not None else 0)
         self._data_item = data
-        self._toolbox = ViewportToolBox(data["image"])
+        self._toolbox = ViewportToolBox(data["image"], max_aspect_ratio=self.max_aspect_ratio)
         self._step_count = 0
         self._trajectory = []
 
@@ -172,7 +179,9 @@ class MedicalGroundingEnv(Env):
             "predicted_viewport": None,
             "gt_bbox": list(self._data_item["gt_bbox"]),
             "success": False,
+            "messages": [],
         })
+        self._messages = []
 
         # env_instruction is prepended to the first user message by VLTrajEnvManager.
         # We leave it empty and rely on agent_system_template in the YAML config
@@ -252,6 +261,7 @@ class MedicalGroundingEnv(Env):
             "predicted_viewport": list(predicted_bbox) if predicted_bbox else None,
             "gt_bbox": list(gt_bbox),
             "success": success,
+            "messages": list(self._messages) if self._messages else [],
         })
 
         # Truncate at max_steps if the agent hasn't answered yet
@@ -313,6 +323,21 @@ class MedicalGroundingEnv(Env):
             "image": [self._toolbox.get_viewport_image()],
         }
 
+    def add_extra_data(self, data: DataProto, messages: List[Dict]) -> None:
+        """Attach VL-generated messages to the rollout data batch and save for trajectory logging."""
+        self._messages = messages
+        # also attach messages to the most recent trajectory step so
+        # they are persisted per-step in the saved trajectory JSON
+        if self._trajectory:
+            try:
+                self._trajectory[-1]["messages"] = list(messages)
+            except Exception:
+                # be defensive: don't raise from env hook
+                logger.debug("Failed to attach messages to last trajectory step")
+        data.non_tensor_batch.update({
+            "messages": np.array([messages], dtype=object),
+        })
+
     def _maybe_save_trajectory(self) -> None:
         """Save this episode's trajectory to disk if logging is configured."""
         if not self.trajectory_log_dir:
@@ -338,30 +363,20 @@ class MedicalGroundingEnv(Env):
             pred_norm = (
                 tuple(step_info["predicted_bbox"]) if step_info["predicted_bbox"] else None
             )
-            annotated = original_toolbox.annotate_viewport(
-                gt_bbox=gt_bbox,
-                pred_bbox_norm=pred_norm,
-            )
-            annotated.save(out_dir / f"step_{step_info['step']:02d}.png")
 
-            current_overlay = original_toolbox.annotate_original(
+            # Clean viewport image (no annotations)
+            clean_viewport = original_toolbox.get_viewport_image()
+            clean_viewport.save(out_dir / f"step_{step_info['step']:02d}_viewport.png")
+
+            # Overlay with viewport + prediction + GT (if prediction exists, otherwise just viewport + GT)
+            full_overlay = original_toolbox.annotate_original(
                 viewport_abs=tuple(vabs),
                 gt_bbox=gt_bbox,
-                pred_bbox_norm=None,
+                pred_bbox_norm=pred_norm,
                 draw_viewport=True,
-                draw_pred=False,
+                draw_pred=pred_norm is not None,
             )
-            current_overlay.save(out_dir / f"step_{step_info['step']:02d}_orig_current.png")
-
-            if pred_norm is not None:
-                pred_overlay = original_toolbox.annotate_original(
-                    viewport_abs=tuple(vabs),
-                    gt_bbox=gt_bbox,
-                    pred_bbox_norm=pred_norm,
-                    draw_viewport=False,
-                    draw_pred=True,
-                )
-                pred_overlay.save(out_dir / f"step_{step_info['step']:02d}_orig_pred.png")
+            full_overlay.save(out_dir / f"step_{step_info['step']:02d}_orig_full.png")
 
         # Save trajectory JSON
         traj_data = {
@@ -371,6 +386,7 @@ class MedicalGroundingEnv(Env):
             "gt_bbox": list(gt_bbox),
             "native_resolution": f"{self._data_item['width']}x{self._data_item['height']}",
             "steps": self._trajectory,
+            "messages": self._messages,
             "episode_reward": sum(s["step_reward"] for s in self._trajectory),
             "final_answer_iou": self._trajectory[-1]["answer_iou"] if self._trajectory else 0.0,
             "success": self._trajectory[-1]["success"] if self._trajectory else False,

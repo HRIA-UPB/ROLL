@@ -20,7 +20,7 @@ output_dir: ./output
 
 checkpoint_config:
   type: file_system
-  output_dir: /data/checkpoints/${exp_name}
+  output_dir: ./output/checkpoints/${exp_name}
 
 track_with: wandb
 tracker_kwargs:
@@ -33,7 +33,7 @@ offload_nccl: true
 num_gpus_per_node: 8
 
 max_steps: 1000
-save_steps: 100
+save_steps: 10000
 logging_steps: 1
 eval_steps: 50
 resume_from_checkpoint: false
@@ -47,10 +47,10 @@ reward_clip: 10
 advantage_clip: 5.0
 ppo_epochs: 1
 adv_estimator: "grpo"
-whiten_advantages: false
+whiten_advantages: true
 add_token_level_kl: false
-use_kl_loss: false
-init_kl_coef: 0.0
+use_kl_loss: true
+init_kl_coef: 0.01
 entropy_loss_coef: 0
 
 pretrain: Qwen/Qwen3-VL-4B-Instruct
@@ -106,7 +106,7 @@ actor_infer:
     top_p: 1.0
     top_k: -1
     num_beams: 1
-    temperature: 1.0
+    temperature: 1.2
     num_return_sequences: 1
   strategy_args:
     strategy_name: vllm
@@ -159,36 +159,11 @@ custom_envs:
     use_thread_lock: true
 
     # System prompt injected as the LLM system message (system role).
-    agent_system_template: |
-      You are a specialized Medical Imaging AI Agent. Your goal is to precisely
-      localize anatomical structures, lesions, or findings described in referring
-      expressions.
-
-      How to respond:
-      ALWAYS start by reasoning inside <think></think> tags before taking any action.
-
-      Tools (call exactly one per turn inside <tool_call></tool_call>):
-        zoom[x1, y1, x2, y2]  – crop the current viewport to a subregion.
-        pan[x, y]              – shift the viewport so [x, y] becomes its center.
-        zoomout[factor]        – expand the field of view (factor > 1.0).
-        resetzoom              – return to the full original image.
-
-      Coordinate conventions (normalized [0, 1]):
-        x increases left→right, y increases top→bottom.
-        All coordinates are relative to the *current* viewport (tools) or the
-        *original* image (<answer>).
-
-      When you have confidently identified the target:
-        <answer>bbox[x1, y1, x2, y2]</answer>
-
-      Example turn:
-        <think>There is a suspicious nodular density in the upper-right region.
-        I should zoom in for a closer look.</think>
-        <tool_call>zoom[0.55, 0.10, 0.95, 0.55]</tool_call>
+    agent_system_template: ${agent_system_template}
 
     # Text injected before/after each observation turn.
-    pre_step_template: ""
-    next_step_template: ""
+    pre_step_template: ${pre_step_template}
+    next_step_template: ${next_step_template}
 
     env_config:
       # --- REQUIRED: update these paths before training ---
@@ -200,12 +175,13 @@ custom_envs:
       seed: ${seed}
       max_steps: ${max_actions_per_traj}
       max_image_width: 512        # resize images to this max width (aspect ratio preserved)
+      max_aspect_ratio: 200.0     # maximum allowed viewport/answer aspect ratio
 
       # Reward shaping
-      step_penalty: -0.01         # applied every step
+      step_penalty: -0.05         # applied every step
       format_penalty: -0.5        # extra penalty when no valid action found
       iou_threshold: 0.5          # IoU >= this counts as success
-      viewport_iou_weight: 0.3    # coefficient for intermediate viewport IoU reward
+      viewport_iou_weight: 0.05    # coefficient for intermediate viewport IoU reward
       answer_iou_weight: 1.0      # coefficient for final answer IoU reward
 
       # Trajectory logging
@@ -229,3 +205,35 @@ val_env_manager:
   tags: [medical_grounding]
   num_groups_partition:
     - ${val_batch_size}
+
+agent_system_template: |
+    You are a specialized Medical Imaging AI Agent. Your goal is to precisely
+    localize anatomical structures, lesions, or findings described in referring
+    expressions.
+
+    How to respond:
+    ALWAYS start by reasoning inside <think></think> tags before taking any action.
+
+    Tools (call exactly one per turn inside <tool_call></tool_call>):
+      zoom[x1, y1, x2, y2]  – crop the current viewport to a subregion.
+      pan[x, y]              – shift the viewport so [x, y] becomes its center.
+      zoomout[factor]        – expand the field of view (factor > 1.0).
+      resetzoom              – return to the full original image.
+
+    Coordinate conventions (normalized [0, 1]):
+      x increases left→right, y increases top→bottom.
+      All coordinates are relative to the *current* viewport (tools and answer).
+
+    When you have confidently identified the target:
+      <answer>bbox[x1, y1, x2, y2]</answer>
+
+    Example turn:
+      <think>There is a suspicious nodular density in the upper-right region.
+      I should zoom in for a closer look.</think>
+      <tool_call>zoom[0.55, 0.10, 0.95, 0.55]</tool_call>
+
+pre_step_template: "\nTurn {turn_idx}:\n"
+next_step_template: |
+    Steps remaining: {actions_left}
+    Max response length: {max_response_length} tokens.
+    Decide the next action:

@@ -1,0 +1,46 @@
+Bootstrap: docker
+From: ubuntu:24.04
+
+%files
+    /export/home/acs/prof/andrei.mihalea/workspace/HRIA/vlm/ROLL /opt/ROLL
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    ln -fs /usr/share/zoneinfo/Europe/Bucharest /etc/localtime
+    apt-get update && apt-get install -y wget curl gnupg2 software-properties-common build-essential tzdata
+    
+    wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i cuda-keyring_1.1-1_all.deb
+    apt-get update
+    apt-get install -y cuda-nvcc-12-8 cuda-cccl-12-8 libnccl2 libnccl-dev \
+                       cuda-cudart-dev-12-8 cuda-libraries-dev-12-8 \
+                       libcudnn9-cuda-12 libcudnn9-dev-cuda-12 \
+                       cuda-nvtx-12-8 libcublas-dev-12-8
+
+    curl -LsSf https://astral.sh/uv/install.sh | BINDIR=/usr/local/bin sh
+    . $HOME/.local/bin/env
+    uv venv /opt/venv --python 3.11
+    
+    export PATH="/opt/venv/bin:/usr/local/cuda-12.8/bin:$PATH"
+    export CUDA_HOME=/usr/local/cuda-12.8
+    export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    export CPATH="/usr/include:$CPATH"
+    export LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH"
+    export VIRTUAL_ENV="/opt/venv"
+
+    cd /opt/ROLL
+    
+    uv pip install -r requirements_custom.txt
+    uv pip install flash-attn --no-build-isolation
+    uv pip install -e .
+
+%environment
+    export PATH="/opt/venv/bin:/usr/local/cuda-12.8/bin:$PATH"
+    export CUDA_HOME=/usr/local/cuda-12.8
+    export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    export CPATH="/usr/include:$CPATH"
+    export LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH"
+    export VIRTUAL_ENV="/opt/venv"
+
+%runscript
+    exec python "$@"

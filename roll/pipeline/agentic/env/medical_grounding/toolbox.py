@@ -45,8 +45,9 @@ class ViewportToolBox:
     _ZOOMOUT_RE = re.compile(r"zoomout\[([\d.]+)\]")
     _RESETZOOM_RE = re.compile(r"resetzoom")
 
-    def __init__(self, image: Image.Image) -> None:
+    def __init__(self, image: Image.Image, max_aspect_ratio: float = 200.0) -> None:
         self.original_image = image
+        self.max_aspect_ratio = max_aspect_ratio
         self._reset_viewport()
 
     def reset(self, image: Image.Image) -> None:
@@ -84,6 +85,12 @@ class ViewportToolBox:
             and vp.y2 == float(self.img_h)
         )
 
+    def _check_aspect_ratio(self, width: float, height: float) -> bool:
+        """Return True if width/height ratio is within the allowed limit."""
+        if min(width, height) <= 0:
+            return False
+        return max(width, height) / min(width, height) <= self.max_aspect_ratio
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -115,42 +122,67 @@ class ViewportToolBox:
     # Tool executors
     # ------------------------------------------------------------------
 
-    def _do_zoom(self, nx1: float, ny1: float, nx2: float, ny2: float) -> bool:
+    def _do_zoom(self, nx1: float, ny1: float, nx2: float, ny2: float) -> Tuple[bool, Optional[str]]:
         if not (0.0 <= nx1 < nx2 <= 1.0 and 0.0 <= ny1 < ny2 <= 1.0):
-            return False
-        self.viewport = self._clamp(*self._norm_to_abs(nx1, ny1, nx2, ny2))
-        return True
+            return False, "Invalid normalized zoom coordinates"
+        viewport = self._clamp(*self._norm_to_abs(nx1, ny1, nx2, ny2))
+        if not self._check_aspect_ratio(viewport.width, viewport.height):
+            return False, (
+                f"Aspect ratio too large for zoom viewport: "
+                f"width={viewport.width:.4f}, height={viewport.height:.4f}, "
+                f"max={self.max_aspect_ratio}"
+            )
+        self.viewport = viewport
+        return True, None
 
-    def _do_pan(self, nx: float, ny: float) -> bool:
+    def _do_pan(self, nx: float, ny: float) -> Tuple[bool, Optional[str]]:
         if not (0.0 <= nx <= 1.0 and 0.0 <= ny <= 1.0):
-            return False
+            return False, "Invalid normalized pan coordinates"
         if self.is_at_full_size():
-            return False  # Cannot pan when already showing full image
+            return False, "Cannot pan when viewport already shows the full image"
         vp = self.viewport
         cx = vp.x1 + nx * vp.width
         cy = vp.y1 + ny * vp.height
-        hw, hh = vp.width / 2, vp.height / 2
-        self.viewport = self._clamp(cx - hw, cy - hh, cx + hw, cy + hh)
-        return True
+        self.viewport = self._clamp(cx - vp.width / 2, cy - vp.height / 2, cx + vp.width / 2, cy + vp.height / 2)
+        return True, None
 
-    def _do_zoomout(self, factor: float) -> bool:
+    def _do_zoomout(self, factor: float) -> Tuple[bool, Optional[str]]:
         if factor <= 1.0:
-            return False
+            return False, "zoomout factor must be > 1.0"
         if self.is_at_full_size():
-            return False  # Cannot zoom out when already showing full image
+            return False, "Cannot zoom out when viewport already shows the full image"
         vp = self.viewport
         cx, cy = (vp.x1 + vp.x2) / 2, (vp.y1 + vp.y2) / 2
-        hw, hh = vp.width * factor / 2, vp.height * factor / 2
-        self.viewport = self._clamp(cx - hw, cy - hh, cx + hw, cy + hh)
-        return True
+        viewport = self._clamp(cx - vp.width * factor / 2, cy - vp.height * factor / 2,
+                               cx + vp.width * factor / 2, cy + vp.height * factor / 2)
+        if not self._check_aspect_ratio(viewport.width, viewport.height):
+            return False, (
+                f"Aspect ratio too large for zoomout viewport: "
+                f"width={viewport.width:.4f}, height={viewport.height:.4f}, "
+                f"max={self.max_aspect_ratio}"
+            )
+        self.viewport = viewport
+        return True, None
 
-    def _do_resetzoom(self) -> bool:
+    def _do_resetzoom(self) -> Tuple[bool, Optional[str]]:
         self._reset_viewport()
-        return True
+        return True, None
 
     # ------------------------------------------------------------------
     # Annotation helper
     # ------------------------------------------------------------------
+
+    def answer_bbox_viewport_to_original_norm(
+        self,
+        bbox: Tuple[float, float, float, float],
+    ) -> Tuple[float, float, float, float]:
+        """Convert a viewport-relative answer bbox to original image normalized coords."""
+        vp = self.viewport
+        ax1 = vp.x1 + bbox[0] * vp.width
+        ay1 = vp.y1 + bbox[1] * vp.height
+        ax2 = vp.x1 + bbox[2] * vp.width
+        ay2 = vp.y1 + bbox[3] * vp.height
+        return ax1 / self.img_w, ay1 / self.img_h, ax2 / self.img_w, ay2 / self.img_h
 
     def annotate_viewport(
         self,
@@ -178,7 +210,7 @@ class ViewportToolBox:
         if gt_bbox is not None:
             rx1, ry1, rx2, ry2 = _abs_to_view(*gt_bbox)
             if rx2 > 0 and ry2 > 0 and rx1 < img.width and ry1 < img.height:
-                draw.rectangle([rx1, ry1, rx2, ry2], outline="red", width=3)
+                draw.rectangle([rx1, ry1, rx2, ry2], outline="green", width=3)
 
         if pred_bbox_norm is not None:
             ax1 = pred_bbox_norm[0] * self.img_w
@@ -187,7 +219,7 @@ class ViewportToolBox:
             ay2 = pred_bbox_norm[3] * self.img_h
             rx1, ry1, rx2, ry2 = _abs_to_view(ax1, ay1, ax2, ay2)
             if rx2 > 0 and ry2 > 0 and rx1 < img.width and ry1 < img.height:
-                draw.rectangle([rx1, ry1, rx2, ry2], outline="lime", width=3)
+                draw.rectangle([rx1, ry1, rx2, ry2], outline="red", width=3)
 
         return img
 
@@ -208,7 +240,7 @@ class ViewportToolBox:
 
         if gt_bbox is not None:
             gx1, gy1, gx2, gy2 = gt_bbox
-            draw.rectangle([gx1, gy1, gx2, gy2], outline="green", width=3)
+            draw.rectangle([gx1, gy1, gx2, gy2], outline="green", width=4)
 
         if draw_pred and pred_bbox_norm is not None:
             px1 = pred_bbox_norm[0] * self.img_w
@@ -239,10 +271,53 @@ class ViewportToolBox:
         # Check for final answer
         answer_m = self._ANSWER_RE.search(action)
         if answer_m:
-            bbox = tuple(float(v) for v in answer_m.groups())
+            try:
+                bbox = tuple(float(v) for v in answer_m.groups())
+            except ValueError:
+                return {
+                    "done": False,
+                    "predicted_bbox": None,
+                    "tool_name": None,
+                    "tool_args": [],
+                    "tool_success": False,
+                    "format_error": True,
+                    "viewport_image": self.get_viewport_image(),
+                    "error_msg": f"Invalid float values in answer bbox: {answer_m.groups()}",
+                }
+            if not (0.0 <= bbox[0] < bbox[2] <= 1.0 and 0.0 <= bbox[1] < bbox[3] <= 1.0):
+                return {
+                    "done": False,
+                    "predicted_bbox": None,
+                    "tool_name": "answer",
+                    "tool_args": list(bbox),
+                    "tool_success": False,
+                    "format_error": True,
+                    "viewport_image": self.get_viewport_image(),
+                    "error_msg": (
+                        "Answer bbox must satisfy 0.0 <= x1 < x2 <= 1.0 and "
+                        "0.0 <= y1 < y2 <= 1.0"
+                    ),
+                }
+            bbox_norm = self.answer_bbox_viewport_to_original_norm(bbox)
+            width = bbox_norm[2] - bbox_norm[0]
+            height = bbox_norm[3] - bbox_norm[1]
+            if not self._check_aspect_ratio(width, height):
+                return {
+                    "done": False,
+                    "predicted_bbox": None,
+                    "tool_name": "answer",
+                    "tool_args": list(bbox),
+                    "tool_success": False,
+                    "format_error": True,
+                    "viewport_image": self.get_viewport_image(),
+                    "error_msg": (
+                        f"Aspect ratio too large for answer bbox: width={width:.4f}, "
+                        f"height={height:.4f}, max={self.max_aspect_ratio}"
+                    ),
+                }
             return {
                 "done": True,
-                "predicted_bbox": bbox,
+                "predicted_bbox": bbox_norm,
                 "tool_name": "answer",
                 "tool_args": list(bbox),
                 "tool_success": True,
@@ -276,17 +351,42 @@ class ViewportToolBox:
         for tool_name, pattern, handler in tool_handlers:
             m = pattern.search(content)
             if m:
-                args: List[float] = [float(v) for v in m.groups()] if m.groups() else []
-                success = handler(m)
+                try:
+                    args: List[float] = [float(v) for v in m.groups()] if m.groups() else []
+                except ValueError:
+                    return {
+                        "done": False,
+                        "predicted_bbox": None,
+                        "tool_name": tool_name,
+                        "tool_args": [],
+                        "tool_success": False,
+                        "format_error": True,
+                        "viewport_image": self.get_viewport_image(),
+                        "error_msg": f"Invalid float values for {tool_name}: {m.groups()}",
+                    }
+                try:
+                    result = handler(m)
+                except ValueError as err:
+                    return {
+                        "done": False,
+                        "predicted_bbox": None,
+                        "tool_name": tool_name,
+                        "tool_args": args,
+                        "tool_success": False,
+                        "format_error": True,
+                        "viewport_image": self.get_viewport_image(),
+                        "error_msg": str(err),
+                    }
+                success, error_msg = result if isinstance(result, tuple) else (bool(result), None)
                 return {
                     "done": False,
                     "predicted_bbox": None,
                     "tool_name": tool_name,
                     "tool_args": args,
                     "tool_success": bool(success),
-                    "format_error": False,
+                    "format_error": not bool(success),
                     "viewport_image": self.get_viewport_image(),
-                    "error_msg": None if success else f"Invalid args for {tool_name}: {args}",
+                    "error_msg": None if success else (error_msg or f"Invalid args for {tool_name}: {args}"),
                 }
 
         return {

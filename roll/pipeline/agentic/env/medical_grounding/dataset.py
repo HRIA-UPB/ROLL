@@ -85,6 +85,7 @@ class MedicalGroundingDataset:
         image = Image.open(image_path).convert("RGB")
 
         # Resize image to max width while preserving aspect ratio
+        scale = 1.0
         if self.max_image_width is not None:
             w, h = image.size
             if w > self.max_image_width:
@@ -93,12 +94,17 @@ class MedicalGroundingDataset:
                 new_h = int(h * scale)
                 image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
+        # Scale gt_bbox coordinates if image was resized
+        bbox = record["bbox"]
+        if scale != 1.0:
+            bbox = [float(v) * scale for v in bbox]
+
         return {
             "image": image,
-            "gt_bbox": tuple(float(v) for v in record["bbox"]),  # (x1, y1, x2, y2) abs px
+            "gt_bbox": tuple(bbox),  # (x1, y1, x2, y2) abs px (scaled if resized)
             "expression": expression,
             "image_id": record["image_id"],
-            "height": int(record["height"]),
-            "width": int(record["width"]),
+            "height": int(record["height"] * scale),
+            "width": int(record["width"] * scale),
             "bbox_id": int(record.get("bbox_id", 0)),
         }

@@ -30,7 +30,7 @@ _TRAJ_TABLE_COLUMNS = [
     "step",
     "expression",
     "gt_bbox",
-    "prompt",
+    "formatted_prompt",
     "tool_name",
     "tool_args",
     "viewport",
@@ -39,8 +39,8 @@ _TRAJ_TABLE_COLUMNS = [
     "step_reward",
     "format_error",
     "response",
-    "viewport_image",
-    "prediction_image",
+    "viewport_only",
+    "full_overlay_image",
 ]
 
 
@@ -54,6 +54,30 @@ class MedicalGroundingPipeline(AgenticPipeline):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_text(content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(item["text"])
+                    elif item.get("type") == "image":
+                        parts.append("[IMAGE]")
+            return "".join(parts)
+        return str(content)
+
+    @staticmethod
+    def _format_messages_as_text(messages: List[Dict]) -> str:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "?").upper()
+            text = MedicalGroundingPipeline._extract_text(msg.get("content", ""))
+            lines.append(f"[{role}]\n{text}")
+        return "\n\n".join(lines)
 
     def _resolve_traj_log_dir(self) -> Optional[str]:
         """Pull trajectory_log_dir from custom_envs config if present."""
@@ -107,27 +131,35 @@ class MedicalGroundingPipeline(AgenticPipeline):
             with open(traj_dir / "trajectory.json") as f:
                 traj: Dict = json.load(f)
 
+            # messages = [system, user0, asst0, user1, asst1, ...]
+            # Before generating response k (1-indexed step), model saw messages[:2*k].
+            all_messages: List[Dict] = traj.get("messages", [])
+
             for step_info in traj.get("steps", []):
                 step_idx = step_info["step"]
 
-                img_path = traj_dir / f"step_{step_idx:02d}_orig_current.png"
-                if not img_path.exists():
-                    img_path = traj_dir / f"step_{step_idx:02d}.png"
-                wb_image = wandb.Image(str(img_path)) if img_path.exists() else None
+                viewport_path = traj_dir / f"step_{step_idx:02d}_viewport.png"
+                wb_viewport_image = (
+                    wandb.Image(str(viewport_path)) if viewport_path.exists() else None
+                )
 
-                pred_img_path = traj_dir / f"step_{step_idx:02d}_orig_pred.png"
-                wb_pred_image = (
-                    wandb.Image(str(pred_img_path)) if pred_img_path.exists() else None
+                full_img_path = traj_dir / f"step_{step_idx:02d}_orig_full.png"
+                wb_full_image = (
+                    wandb.Image(str(full_img_path)) if full_img_path.exists() else None
                 )
 
                 response = step_info.get("response", "")
-                prompt = step_info.get("prompt", "")
+                # Reconstruct the exact prompt the model saw before generating this step's response.
+                # Step 0 is the initial state (no response yet); step k>=1 means the model was
+                # shown messages[:2*k] (system + k-1 user/assistant pairs + current user turn).
+                slice_end = max(2, 2 * step_idx) if step_idx > 0 else 2
+                formatted_prompt = self._format_messages_as_text(all_messages[:slice_end])
 
                 table.add_data(
                     step_info.get("step", -1),
                     traj.get("expression", ""),
                     str(traj.get("gt_bbox", [])),
-                    prompt,
+                    formatted_prompt,
                     step_info.get("tool_name", ""),
                     str(step_info.get("tool_args", [])),
                     str(step_info.get("viewport", step_info.get("viewport_abs", []))),
@@ -136,8 +168,8 @@ class MedicalGroundingPipeline(AgenticPipeline):
                     step_info.get("step_reward", 0.0),
                     step_info.get("format_error", False),
                     response,
-                    wb_image,
-                    wb_pred_image,
+                    wb_viewport_image,
+                    wb_full_image,
                 )
 
         self.tracker.run.log(
